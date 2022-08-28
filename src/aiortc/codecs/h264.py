@@ -7,6 +7,7 @@ from typing import Iterator, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import av
 from av.frame import Frame
+from av.packet import Packet
 
 from ..jitterbuffer import JitterFrame
 from ..mediastreams import VIDEO_TIME_BASE, convert_timebase
@@ -222,32 +223,30 @@ class H264Encoder(Encoder):
 
     @staticmethod
     def _split_bitstream(buf: bytes) -> Iterator[bytes]:
-        # TODO: write in a more pytonic way,
-        # translate from: https://github.com/aizvorski/h264bitstream/blob/master/h264_nal.c#L134
+        # Translated from: https://github.com/aizvorski/h264bitstream/blob/master/h264_nal.c#L134
         i = 0
         while True:
-            while (buf[i] != 0 or buf[i + 1] != 0 or buf[i + 2] != 0x01) and (
-                buf[i] != 0 or buf[i + 1] != 0 or buf[i + 2] != 0 or buf[i + 3] != 0x01
-            ):
-                i += 1  # skip leading zero
-                if i + 4 >= len(buf):
-                    return
-            if buf[i] != 0 or buf[i + 1] != 0 or buf[i + 2] != 0x01:
-                i += 1
+            # Find the start of the NAL unit
+            # NAL Units start with a 3-byte or 4 byte start code of 0x000001 or 0x00000001
+            # while buf[i:i+3] != b'\x00\x00\x01':
+            i = buf.find(b"\x00\x00\x01", i)
+            if i == -1:
+                return
+
+            # Jump past the start code
             i += 3
             nal_start = i
-            while (buf[i] != 0 or buf[i + 1] != 0 or buf[i + 2] != 0) and (
-                buf[i] != 0 or buf[i + 1] != 0 or buf[i + 2] != 0x01
-            ):
-                i += 1
-                # FIXME: the next line fails when reading a nal that ends
-                # exactly at the end of the data
-                if i + 3 >= len(buf):
-                    nal_end = len(buf)
-                    yield buf[nal_start:nal_end]
-                    return  # did not find nal end, stream ended first
-            nal_end = i
-            yield buf[nal_start:nal_end]
+
+            # Find the end of the NAL unit (end of buffer OR next start code)
+            i = buf.find(b"\x00\x00\x01", i)
+            if i == -1:
+                yield buf[nal_start : len(buf)]
+                return
+            elif buf[i - 1] == 0:
+                # 4-byte start code case, jump back one byte
+                yield buf[nal_start : i - 1]
+            else:
+                yield buf[nal_start:i]
 
     @classmethod
     def _packetize(cls, packages: Iterator[bytes]) -> List[bytes]:
@@ -279,6 +278,9 @@ class H264Encoder(Encoder):
             self.buffer_pts = None
             self.codec = None
 
+        # reset the picture type, otherwise no B-frames are produced
+        frame.pict_type = av.video.frame.PictureType.NONE
+
         if self.codec is None:
             try:
                 self.codec, self.codec_buffering = create_encoder_context(
@@ -294,7 +296,7 @@ class H264Encoder(Encoder):
 
         data_to_send = b""
         for package in self.codec.encode(frame):
-            package_bytes = package.to_bytes()
+            package_bytes = bytes(package)
             if self.codec_buffering:
                 # delay sending to ensure we accumulate all packages
                 # for a given PTS
@@ -316,6 +318,12 @@ class H264Encoder(Encoder):
         assert isinstance(frame, av.VideoFrame)
         packages = self._encode_frame(frame, force_keyframe)
         timestamp = convert_timebase(frame.pts, frame.time_base, VIDEO_TIME_BASE)
+        return self._packetize(packages), timestamp
+
+    def pack(self, packet: Packet) -> Tuple[List[bytes], int]:
+        assert isinstance(packet, av.Packet)
+        packages = self._split_bitstream(bytes(packet))
+        timestamp = convert_timebase(packet.pts, packet.time_base, VIDEO_TIME_BASE)
         return self._packetize(packages), timestamp
 
     @property
